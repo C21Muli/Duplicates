@@ -9,32 +9,123 @@ Always writes an Excel workbook alongside terminal output.
 
 Usage:
     python duplicate_entities_analysis.py [--threshold 85] [--dsn "dbname=..."] [--xlsx out.xlsx]
+    python duplicate_entities_analysis.py --dry-run
+    python duplicate_entities_analysis.py --config config.yaml
 """
 
 import argparse
+import logging
 import sys
 from collections import defaultdict
 from datetime import datetime
 from itertools import combinations
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import re
 
 import psycopg2
+import yaml
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 from rapidfuzz import fuzz
 from tabulate import tabulate
+from tqdm import tqdm
 
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('duplicate_analysis.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Fuzzy scoring
 # ---------------------------------------------------------------------------
 
+# Compiled once at import time
+_AMPERSAND_RE = re.compile(r"\s*&\s*")
+_PUNCT_RE     = re.compile(r"[^\w\s]")
+_SPACE_RE     = re.compile(r"\s+")
+# Common legal suffixes that differ between duplicate registrations
+_SUFFIX_RE    = re.compile(
+    r"\s*\b(ltd|limited|llp|llc|co|company|inc|plc|pvt|pty|group|associates?)\b\.?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _normalize(s: str) -> str:
+    """Lowercase, replace & with 'and', strip punctuation, collapse spaces."""
+    s = _AMPERSAND_RE.sub(" and ", s)
+    s = _PUNCT_RE.sub(" ", s)
+    return _SPACE_RE.sub(" ", s).strip().lower()
+
+
+def _strip_suffix(s: str) -> str:
+    """Remove trailing legal suffix from a normalised string."""
+    return _SUFFIX_RE.sub("", s).strip()
+
+
 def similarity(a: str, b: str) -> float:
     """
-    max(ratio, token_sort_ratio): strict enough to avoid false positives from
-    shared industry keywords, but catches spacing/punctuation/order variants.
+    Returns the best of four scores:
+      - ratio and token_sort_ratio on normalised strings
+        (catches spacing / punctuation / word-order variants)
+      - ratio and token_sort_ratio on suffix-stripped strings
+        (catches 'ABC LTD' vs 'ABC LIMITED' vs 'ABC')
+
+    Deliberately excludes partial_ratio and token_set_ratio to avoid
+    false positives where unrelated entities share industry keywords
+    like 'GARAGE LTD'.
     """
-    return max(fuzz.ratio(a, b), fuzz.token_sort_ratio(a, b))
+    if not a or not b:
+        return 0.0
+    an, bn   = _normalize(a),        _normalize(b)
+    as_, bs_ = _strip_suffix(an),    _strip_suffix(bn)
+    return max(
+        fuzz.ratio(an, bn),
+        fuzz.token_sort_ratio(an, bn),
+        fuzz.ratio(as_, bs_),
+        fuzz.token_sort_ratio(as_, bs_),
+    )
+
+
+def is_similar_name(name1: str, name2: str, threshold: int) -> bool:
+    """Check if two names are similar above threshold."""
+    return similarity(name1, name2) >= threshold
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+def load_config(config_path: Optional[str] = None) -> dict:
+    """Load configuration from YAML file if provided."""
+    default_config = {
+        'threshold': 85,
+        'dsn': 'dbname=test_flippro_hostke',
+        'block_size': 100,
+        'output_dir': '.',
+        'excel_prefix': 'duplicate_report'
+    }
+    
+    if config_path and Path(config_path).exists():
+        try:
+            with open(config_path) as f:
+                user_config = yaml.safe_load(f)
+                default_config.update(user_config)
+                logger.info(f"Loaded configuration from {config_path}")
+        except Exception as e:
+            logger.warning(f"Failed to load config {config_path}: {e}")
+    
+    return default_config
 
 
 # ---------------------------------------------------------------------------
@@ -42,17 +133,53 @@ def similarity(a: str, b: str) -> float:
 # ---------------------------------------------------------------------------
 
 def connect(dsn: str):
+    """Connect to PostgreSQL database."""
     try:
-        return psycopg2.connect(dsn)
+        conn = psycopg2.connect(dsn)
+        logger.info(f"Connected to database: {dsn}")
+        return conn
     except psycopg2.OperationalError as e:
-        print(f"[ERROR] Cannot connect to database: {e}", file=sys.stderr)
+        logger.error(f"Cannot connect to database: {e}")
         sys.exit(1)
 
 
 def fetch(cur, sql: str, params=None) -> list[dict]:
-    cur.execute(sql, params)
-    cols = [d[0] for d in cur.description]
-    return [dict(zip(cols, row)) for row in cur.fetchall()]
+    """Execute query and return results as list of dicts."""
+    try:
+        cur.execute(sql, params)
+        cols = [d[0] for d in cur.description]
+        results = [dict(zip(cols, row)) for row in cur.fetchall()]
+        logger.debug(f"Query returned {len(results)} rows")
+        return results
+    except Exception as e:
+        logger.error(f"Query failed: {e}")
+        logger.error(f"SQL: {sql}")
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Data validation
+# ---------------------------------------------------------------------------
+
+def validate_entities(entities: List[dict]) -> bool:
+    """Validate entity data before processing."""
+    issues = []
+    for e in entities:
+        if not e.get('name'):
+            issues.append(f"Entity ID {e.get('id', 'unknown')} has no name")
+        if not e.get('id'):
+            issues.append("Entity found without ID")
+    
+    if issues:
+        logger.warning(f"Found {len(issues)} data quality issues:")
+        for issue in issues[:10]:  # Show first 10
+            logger.warning(f"  - {issue}")
+        if len(issues) > 10:
+            logger.warning(f"  ... and {len(issues) - 10} more")
+        return False
+    
+    logger.info("Entity validation passed")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -60,18 +187,27 @@ def fetch(cur, sql: str, params=None) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def load_entities(cur) -> list[dict]:
-    return fetch(cur, """
+    """Load all entities with their types."""
+    logger.info("Loading entities...")
+    entities = fetch(cur, """
         SELECT e.id, e.name, e.email, e.phone_number, e.status,
                e.client_key, e.is_onboarded, e.v_one_id,
                e.physical_address,
                et.name AS entity_type
         FROM entities e
         LEFT JOIN entity_type et ON et.id = e.entity_type_id
+        WHERE e.name IS NOT NULL AND e.name != ''
         ORDER BY e.name
     """)
+    
+    validate_entities(entities)
+    logger.info(f"Loaded {len(entities)} entities")
+    return entities
 
 
 def load_appointments(cur) -> dict[str, dict]:
+    """Load appointment statistics for service providers."""
+    logger.info("Loading appointments...")
     rows = fetch(cur, """
         SELECT service_provider_id::text AS eid,
                COUNT(*)                  AS total,
@@ -82,10 +218,14 @@ def load_appointments(cur) -> dict[str, dict]:
         WHERE service_provider_id IS NOT NULL
         GROUP BY service_provider_id
     """)
-    return {r["eid"]: r for r in rows}
+    result = {r["eid"]: r for r in rows}
+    logger.info(f"Loaded appointments for {len(result)} entities")
+    return result
 
 
 def load_insurance_mappings(cur) -> dict[str, list[dict]]:
+    """Load insurance mappings for entities."""
+    logger.info("Loading insurance mappings...")
     rows = fetch(cur, """
         SELECT ete.service_provider_id::text AS sp_id,
                ete.id::text                  AS mapping_id,
@@ -102,10 +242,13 @@ def load_insurance_mappings(cur) -> dict[str, list[dict]]:
     result = defaultdict(list)
     for r in rows:
         result[r["sp_id"]].append(r)
+    logger.info(f"Loaded mappings for {len(result)} entities")
     return result
 
 
 def load_branches(cur) -> dict[str, list[dict]]:
+    """Load branch information for entities."""
+    logger.info("Loading branches...")
     rows = fetch(cur, """
         SELECT eb.entity_id::text AS eid,
                eb.id::text        AS branch_id,
@@ -119,25 +262,44 @@ def load_branches(cur) -> dict[str, list[dict]]:
     result = defaultdict(list)
     for r in rows:
         result[r["eid"]].append(r)
+    logger.info(f"Loaded branches for {len(result)} entities")
     return result
 
 
 # ---------------------------------------------------------------------------
-# Duplicate grouping
+# Duplicate grouping (optimized)
 # ---------------------------------------------------------------------------
 
-def find_duplicate_groups(entities: list[dict], threshold: int) -> list[list[dict]]:
+def find_duplicate_groups_optimized(
+    entities: list[dict],
+    threshold: int,
+    block_size: int = 3,   # kept in signature for config compat, no longer used
+) -> list[list[dict]]:
+    """
+    Compare every entity pair (full O(n²) scan) with a progress bar.
+    Blocking is intentionally skipped: at ~950 entities the full scan
+    finishes in seconds and blocking risks missing cross-prefix duplicates
+    (e.g. 'ABC MOTORS' vs 'ABC MOTORS LTD' could land in different prefix blocks).
+    """
     n = len(entities)
+    logger.info(f"Finding duplicates among {n} entities (threshold: {threshold}%)")
+
+    if n < 2:
+        return []
+
     adjacency = defaultdict(set)
+    total = n * (n - 1) // 2
 
-    for i, j in combinations(range(n), 2):
-        score = similarity(entities[i]["name"], entities[j]["name"])
-        if score >= threshold:
-            adjacency[i].add(j)
-            adjacency[j].add(i)
+    with tqdm(total=total, desc="Comparing entities", unit="pair") as pbar:
+        for i, j in combinations(range(n), 2):
+            if similarity(entities[i]["name"], entities[j]["name"]) >= threshold:
+                adjacency[i].add(j)
+                adjacency[j].add(i)
+            pbar.update(1)
 
+    # BFS connected components
     visited = set()
-    groups = []
+    groups  = []
     for start in range(n):
         if start in visited or start not in adjacency:
             continue
@@ -153,7 +315,14 @@ def find_duplicate_groups(entities: list[dict], threshold: int) -> list[list[dic
         if len(group_indices) > 1:
             groups.append([entities[i] for i in sorted(group_indices)])
 
+    logger.info(f"Found {len(groups)} duplicate groups")
     return groups
+
+
+# Legacy function for backward compatibility
+def find_duplicate_groups(entities: list[dict], threshold: int) -> list[list[dict]]:
+    """Original duplicate finding logic (maintained for comparison)."""
+    return find_duplicate_groups_optimized(entities, threshold)
 
 
 def rank_group(group, appt_map, ins_map, branch_map):
@@ -187,6 +356,7 @@ def section(title: str):
 
 
 def print_group(group, appt_map, ins_map, branch_map, threshold):
+    """Print detailed analysis for a duplicate group."""
     # Similarity scores
     print("\nSimilarity scores (pairs that meet threshold):")
     pairs = []
@@ -272,12 +442,10 @@ def print_group(group, appt_map, ins_map, branch_map, threshold):
 # ---------------------------------------------------------------------------
 
 # Palette
-_HDR_FILL   = PatternFill("solid", fgColor="1F4E79")   # dark blue
-_KEEP_FILL  = PatternFill("solid", fgColor="C6EFCE")   # light green
-_REM_FILL   = PatternFill("solid", fgColor="FFDDC1")   # light orange
-_GRP_FILL   = PatternFill("solid", fgColor="D9E1F2")   # light steel blue (group label rows)
-_WHITE_FONT = Font(bold=True, color="FFFFFF")
-_HDR_FONT   = Font(bold=True, color="FFFFFF")
+_HDR_FILL  = PatternFill("solid", fgColor="1F4E79")   # dark blue
+_KEEP_FILL = PatternFill("solid", fgColor="C6EFCE")   # light green
+_REM_FILL  = PatternFill("solid", fgColor="FFDDC1")   # light orange
+_HDR_FONT  = Font(bold=True, color="FFFFFF")
 _BOLD       = Font(bold=True)
 _THIN       = Side(style="thin", color="BFBFBF")
 _BORDER     = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
@@ -286,6 +454,7 @@ _LEFT       = Alignment(horizontal="left",   vertical="center", wrap_text=True)
 
 
 def _hdr_row(ws, row_num: int, values: list):
+    """Create a styled header row."""
     for col, val in enumerate(values, 1):
         c = ws.cell(row=row_num, column=col, value=val)
         c.fill   = _HDR_FILL
@@ -295,6 +464,7 @@ def _hdr_row(ws, row_num: int, values: list):
 
 
 def _data_cell(ws, row_num: int, col: int, value, fill=None, bold=False, center=False):
+    """Create a styled data cell."""
     c = ws.cell(row=row_num, column=col, value=value)
     if fill:
         c.fill = fill
@@ -306,6 +476,7 @@ def _data_cell(ws, row_num: int, col: int, value, fill=None, bold=False, center=
 
 
 def _auto_width(ws, min_w=10, max_w=50):
+    """Auto-fit column widths."""
     for col_cells in ws.columns:
         length = max(
             (len(str(c.value)) if c.value is not None else 0) for c in col_cells
@@ -314,7 +485,8 @@ def _auto_width(ws, min_w=10, max_w=50):
             max(min_w, min(length + 3, max_w))
 
 
-def build_workbook(groups, appt_map, ins_map, branch_map, threshold, dsn) -> Workbook:
+def build_workbook(groups, appt_map, ins_map, branch_map, threshold) -> Workbook:
+    """Build complete Excel workbook with all analysis sheets."""
     wb = Workbook()
     wb.remove(wb.active)   # remove default sheet
 
@@ -327,7 +499,8 @@ def build_workbook(groups, appt_map, ins_map, branch_map, threshold, dsn) -> Wor
     return wb
 
 
-def _sheet_workplan(wb, groups, appt_map, ins_map, branch_map, threshold):
+def _sheet_workplan(wb, groups, appt_map, ins_map, branch_map, threshold):  # noqa: PLR0913
+    """Create main workplan/summary sheet."""
     ws = wb.create_sheet("Workplan (Summary)")
     ws.freeze_panes = "A2"
 
@@ -378,6 +551,7 @@ def _sheet_workplan(wb, groups, appt_map, ins_map, branch_map, threshold):
 
 
 def _sheet_appointments(wb, groups, appt_map):
+    """Create appointments detail sheet."""
     ws = wb.create_sheet("Appointments")
     ws.freeze_panes = "A2"
 
@@ -406,6 +580,7 @@ def _sheet_appointments(wb, groups, appt_map):
 
 
 def _sheet_mappings(wb, groups, ins_map):
+    """Create insurance mappings detail sheet."""
     ws = wb.create_sheet("Insurance Mappings")
     ws.freeze_panes = "A2"
 
@@ -448,6 +623,7 @@ def _sheet_mappings(wb, groups, ins_map):
 
 
 def _sheet_branches(wb, groups, branch_map):
+    """Create branches detail sheet."""
     ws = wb.create_sheet("Branches")
     ws.freeze_panes = "A2"
 
@@ -488,6 +664,7 @@ def _sheet_branches(wb, groups, branch_map):
 
 
 def _sheet_similarity(wb, groups, threshold):
+    """Create similarity scores detail sheet."""
     ws = wb.create_sheet("Similarity Scores")
     ws.freeze_panes = "A2"
 
@@ -517,56 +694,106 @@ def _sheet_similarity(wb, groups, threshold):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--threshold", type=int, default=85,
+    parser.add_argument("--threshold", type=int, default=None,
                         help="Fuzzy similarity threshold %% (default: 85)")
-    parser.add_argument("--dsn", default="dbname=test_flippro_hostke",
+    parser.add_argument("--dsn", default=None,
                         help="PostgreSQL DSN (default: dbname=test_flippro_hostke)")
     parser.add_argument("--xlsx", default=None,
                         help="Excel output path (default: duplicate_report_<timestamp>.xlsx)")
     parser.add_argument("--no-terminal", action="store_true",
                         help="Suppress terminal table output (Excel only)")
+    parser.add_argument("--config", default=None,
+                        help="YAML configuration file path")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Analyze without generating Excel")
+    parser.add_argument("--debug", action="store_true",
+                        help="Enable debug logging")
     args = parser.parse_args()
 
-    xlsx_path = args.xlsx or f"duplicate_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    # Configure logging level
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
 
-    conn = connect(args.dsn)
+    # Load configuration
+    config = load_config(args.config)
+    
+    # Use command line args or config values
+    threshold = args.threshold or config.get('threshold', 85)
+    dsn = args.dsn or config.get('dsn', 'dbname=test_flippro_hostke')
+    
+    # Generate output path
+    if args.xlsx:
+        xlsx_path = args.xlsx
+    else:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_dir = config.get('output_dir', '.')
+        prefix = config.get('excel_prefix', 'duplicate_report')
+        xlsx_path = str(Path(output_dir) / f"{prefix}_{timestamp}.xlsx")
+
+    logger.info(f"Starting duplicate entity analysis")
+    logger.info(f"Connected  : {dsn}")
+    logger.info(f"Threshold  : {threshold}%")
+    if not args.dry_run:
+        logger.info(f"Excel out  : {xlsx_path}")
+
+    conn = connect(dsn)
     cur  = conn.cursor()
 
-    print(f"\nConnected  : {args.dsn}")
-    print(f"Threshold  : {args.threshold}%  (max of ratio + token_sort_ratio)")
-    print(f"Excel out  : {xlsx_path}")
+    try:
+        entities   = load_entities(cur)
+        appt_map   = load_appointments(cur)
+        ins_map    = load_insurance_mappings(cur)
+        branch_map = load_branches(cur)
 
-    entities   = load_entities(cur)
-    appt_map   = load_appointments(cur)
-    ins_map    = load_insurance_mappings(cur)
-    branch_map = load_branches(cur)
+        if not entities:
+            logger.warning("No entities loaded from database")
+            return
 
-    print(f"Entities   : {len(entities)} loaded — scanning for duplicates...\n")
+        logger.info(f"Entities   : {len(entities)} loaded — scanning for duplicates...")
 
-    groups = find_duplicate_groups(entities, args.threshold)
+        # Find duplicate groups
+        groups = find_duplicate_groups_optimized(entities, threshold)
 
-    if not groups:
-        print(f"No duplicate groups found at {args.threshold}% threshold.")
-        cur.close(); conn.close()
-        return
+        if not groups:
+            logger.info(f"No duplicate groups found at {threshold}% threshold.")
+            if not args.dry_run:
+                # Still create empty report for documentation
+                wb = Workbook()
+                ws = wb.active
+                ws.title = "No Duplicates Found"
+                ws.cell(1, 1, f"No duplicate entities found at {threshold}% threshold")
+                ws.cell(2, 1, f"Total entities analyzed: {len(entities)}")
+                ws.cell(3, 1, f"Analysis timestamp: {datetime.now().isoformat()}")
+                wb.save(xlsx_path)
+                logger.info(f"Saved empty report → {xlsx_path}")
+            return
 
-    print(f"Found {len(groups)} duplicate group(s).\n")
+        logger.info(f"Found {len(groups)} duplicate group(s).")
 
-    if not args.no_terminal:
-        for idx, group in enumerate(groups, 1):
-            print(f"\n{'#' * 78}")
-            print(f"  DUPLICATE GROUP {idx} of {len(groups)}:  {group[0]['name']}")
-            print(f"{'#' * 78}")
-            print_group(group, appt_map, ins_map, branch_map, args.threshold)
+        # Terminal output
+        if not args.no_terminal:
+            for idx, group in enumerate(groups, 1):
+                print(f"\n{'#' * 78}")
+                print(f"  DUPLICATE GROUP {idx} of {len(groups)}:  {group[0]['name']}")
+                print(f"{'#' * 78}")
+                print_group(group, appt_map, ins_map, branch_map, threshold)
 
-    print(f"\nBuilding Excel workbook...")
-    wb = build_workbook(groups, appt_map, ins_map, branch_map, args.threshold, args.dsn)
-    wb.save(xlsx_path)
-    print(f"Saved → {xlsx_path}")
+        # Excel output
+        if not args.dry_run:
+            logger.info("Building Excel workbook...")
+            wb = build_workbook(groups, appt_map, ins_map, branch_map, threshold)
+            wb.save(xlsx_path)
+            logger.info(f"Saved → {xlsx_path}")
+        else:
+            logger.info("Dry run completed — no Excel file generated")
 
-    cur.close()
-    conn.close()
-    print(f"\n{DIVIDER}\n  Analysis complete.\n{DIVIDER}")
+    except Exception as e:
+        logger.error(f"Analysis failed: {e}", exc_info=True)
+        sys.exit(1)
+    finally:
+        cur.close()
+        conn.close()
+        logger.info(f"\n{DIVIDER}\n  Analysis complete.\n{DIVIDER}")
 
 
 if __name__ == "__main__":
