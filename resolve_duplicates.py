@@ -20,7 +20,7 @@ Other flags:
     --dry-run          Show what would happen without touching the DB.
     --group N          Process only group N (1-based, same numbering as analysis output).
     --threshold N      Fuzzy similarity threshold (default: 85).
-    --dsn "..."        PostgreSQL DSN (default: dbname=test_flippro_hostke).
+    --dsn "..."        PostgreSQL DSN (or set DSN= in .env).
 
 Batch CSV format (header required):
     group_number,action,keep_entity_id
@@ -35,14 +35,19 @@ Actions: ACCEPT | OVERRIDE | SKIP | NOT_DUPLICATE
 import argparse
 import csv
 import logging
+import os
 import re
 import sys
 from collections import defaultdict
 from itertools import combinations
+
 import psycopg2
+from dotenv import load_dotenv
 from rapidfuzz import fuzz
 from tabulate import tabulate
 from tqdm import tqdm
+
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -69,6 +74,12 @@ _SUFFIX_RE    = re.compile(
     re.IGNORECASE,
 )
 
+# Emails assigned to on-the-fly entity creation — not a real business email,
+# so a shared address here does NOT indicate a duplicate.
+_GARBAGE_EMAILS = frozenset({
+    "development@innovexsolutions.co.ke",
+})
+
 
 def _normalize(s: str) -> str:
     s = _AMPERSAND_RE.sub(" and ", s)
@@ -93,15 +104,37 @@ def similarity(a: str, b: str) -> float:
     )
 
 
+def _real_email(e: dict) -> str:
+    """Return lowercased email if it's a real business address, else empty string."""
+    addr = (e.get("email") or "").strip().lower()
+    return addr if addr and addr not in _GARBAGE_EMAILS else ""
+
+
+def email_match(a: dict, b: dict) -> bool:
+    ea, eb = _real_email(a), _real_email(b)
+    return bool(ea and ea == eb)
+
+
+def entity_similarity(a: dict, b: dict) -> float:
+    """Name similarity, boosted to 100 when both entities share a real email."""
+    if email_match(a, b):
+        return 100.0
+    return similarity(a["name"], b["name"])
+
+
 # ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
+
+def _safe_dsn(dsn: str) -> str:
+    return re.sub(r"(password\s*=\s*)\S+", r"\1***", dsn, flags=re.IGNORECASE)
+
 
 def connect(dsn: str):
     try:
         conn = psycopg2.connect(dsn)
         conn.autocommit = False
-        logger.info(f"Connected to: {dsn}")
+        logger.info(f"Connected to: {_safe_dsn(dsn)}")
         return conn
     except psycopg2.OperationalError as e:
         logger.error(f"Cannot connect: {e}")
@@ -188,33 +221,66 @@ def load_branches(cur) -> dict[str, list[dict]]:
 # ---------------------------------------------------------------------------
 
 def find_duplicate_groups(entities: list[dict], threshold: int) -> list[list[dict]]:
+    """
+    Complete-linkage clustering: an entity joins a group only if it meets the
+    threshold with every existing member. This prevents chain-linking where
+    A≈B and B≈C at 60% pulls unrelated A and C into the same group.
+    Pairs are processed strongest-first so high-confidence pairs form group cores.
+    """
     n = len(entities)
-    adjacency = defaultdict(set)
-    total = n * (n - 1) // 2
+    if n < 2:
+        return []
 
+    # Collect all pairs above threshold with their scores.
+    sim_pairs: dict[tuple[int, int], float] = {}
+    total = n * (n - 1) // 2
     with tqdm(total=total, desc="Scanning for duplicates", unit="pair") as pbar:
         for i, j in combinations(range(n), 2):
-            if similarity(entities[i]["name"], entities[j]["name"]) >= threshold:
-                adjacency[i].add(j)
-                adjacency[j].add(i)
+            s = entity_similarity(entities[i], entities[j])
+            if s >= threshold:
+                sim_pairs[(i, j)] = s  # i < j always (combinations guarantees this)
             pbar.update(1)
 
-    visited, groups = set(), []
-    for start in range(n):
-        if start in visited or start not in adjacency:
-            continue
-        group_indices, queue = set(), [start]
-        while queue:
-            node = queue.pop()
-            if node in visited:
-                continue
-            visited.add(node)
-            group_indices.add(node)
-            queue.extend(adjacency[node] - visited)
-        if len(group_indices) > 1:
-            groups.append([entities[i] for i in sorted(group_indices)])
+    # Complete-linkage clustering — process strongest pairs first.
+    group_id: dict[int, int] = {}
+    members:  dict[int, set[int]] = {}
+    next_gid  = 0
 
-    return groups
+    def all_connected(idx: int, grp: set[int]) -> bool:
+        return all((min(idx, m), max(idx, m)) in sim_pairs for m in grp)
+
+    for (i, j) in sorted(sim_pairs, key=lambda p: -sim_pairs[p]):
+        gi, gj = group_id.get(i), group_id.get(j)
+
+        if gi is None and gj is None:
+            members[next_gid] = {i, j}
+            group_id[i] = group_id[j] = next_gid
+            next_gid += 1
+
+        elif gi is None:
+            if all_connected(i, members[gj]):
+                members[gj].add(i)
+                group_id[i] = gj
+
+        elif gj is None:
+            if all_connected(j, members[gi]):
+                members[gi].add(j)
+                group_id[j] = gi
+
+        elif gi != gj:
+            # Merge only when every cross-group pair meets threshold.
+            if all((min(a, b), max(a, b)) in sim_pairs
+                   for a in members[gi] for b in members[gj]):
+                keep, drop = (gi, gj) if len(members[gi]) >= len(members[gj]) else (gj, gi)
+                for m in members[drop]:
+                    group_id[m] = keep
+                members[keep].update(members.pop(drop))
+
+    return [
+        [entities[i] for i in sorted(grp)]
+        for grp in members.values()
+        if len(grp) >= 2
+    ]
 
 
 def rank_group(group, appt_map, ins_map, branch_map) -> list[dict]:
@@ -244,14 +310,16 @@ def print_group_summary(g_idx: int, group: list[dict], ranked: list[dict], thres
     print(f"{'#' * 74}")
 
     # Similarity scores
-    pairs = [
-        [a["name"], b["name"], f"{round(similarity(a['name'], b['name']))}%"]
-        for a, b in combinations(group, 2)
-        if similarity(a["name"], b["name"]) >= threshold
-    ]
+    pairs = []
+    for a, b in combinations(group, 2):
+        name_score = round(similarity(a["name"], b["name"]))
+        em = email_match(a, b)
+        if entity_similarity(a, b) >= threshold:
+            pairs.append([a["name"], b["name"], f"{name_score}%",
+                          "yes" if em else ""])
     if pairs:
         print("\nSimilarity (pairs meeting threshold):")
-        print(tabulate(pairs, headers=["Entity A", "Entity B", "Score"],
+        print(tabulate(pairs, headers=["Entity A", "Entity B", "Name Score", "Email Match"],
                        tablefmt="rounded_outline"))
 
     # Consolidated summary
@@ -261,7 +329,7 @@ def print_group_summary(g_idx: int, group: list[dict], ranked: list[dict], thres
         rows.append([
             i + 1,
             e["name"],
-            e["id"],
+            e["email"] or "—",
             e["client_key"] or "—",
             e["status"],
             r["appointments"],
@@ -271,7 +339,7 @@ def print_group_summary(g_idx: int, group: list[dict], ranked: list[dict], thres
         ])
     print()
     print(tabulate(rows, tablefmt="rounded_outline", headers=[
-        "#", "Name", "ID", "Client Key", "Status",
+        "#", "Name", "Email", "Client Key", "Status",
         "Appts", "Ins. Maps", "Branches", "Suggestion",
     ]))
 
@@ -331,7 +399,11 @@ def migrate_entity(cur, remove_e: dict, keep_e: dict, dry_run: bool) -> dict:
     migrated_maps, skipped_maps = 0, 0
     for m in mappings_to_move:
         if m["insurance_id"] in existing_insurers:
-            logger.info(f"  Mapping {m['id']} skipped — kept entity already mapped to this insurer")
+            # Duplicate mapping — delete it so the FK doesn't block entity deletion.
+            execute(cur,
+                "DELETE FROM entity_to_entity WHERE id = %s",
+                (m["id"],), dry_run)
+            logger.info(f"  Mapping {m['id']} deleted — kept entity already mapped to this insurer")
             skipped_maps += 1
         else:
             execute(cur,
@@ -341,8 +413,8 @@ def migrate_entity(cur, remove_e: dict, keep_e: dict, dry_run: bool) -> dict:
             migrated_maps += 1
 
     summary["insurance_mappings_migrated"] = migrated_maps
-    summary["insurance_mappings_skipped"]  = skipped_maps
-    logger.info(f"  Insurance mappings migrated: {migrated_maps}, skipped (conflict): {skipped_maps}")
+    summary["insurance_mappings_deleted"]  = skipped_maps
+    logger.info(f"  Insurance mappings migrated: {migrated_maps}, deleted (conflict): {skipped_maps}")
 
     # 3. entity_to_entity — insurance_id (when removed entity IS an insurer)
     n = execute(cur,
@@ -415,13 +487,14 @@ def migrate_entity(cur, remove_e: dict, keep_e: dict, dry_run: bool) -> dict:
 
 def resolve_group(
     conn, cur,
-    group: list[dict],
     ranked: list[dict],
     keep_entity: dict,
     dry_run: bool,
+    removes: list[dict] | None = None,
 ) -> bool:
     """Run full migration for one group inside a transaction. Returns True on success."""
-    removes = [r["entity"] for r in ranked if r["entity"]["id"] != keep_entity["id"]]
+    if removes is None:
+        removes = [r["entity"] for r in ranked if r["entity"]["id"] != keep_entity["id"]]
 
     logger.info(f"\nResolving group: keep={keep_entity['name']} ({keep_entity['client_key']})")
     for rem in removes:
@@ -453,38 +526,90 @@ def resolve_group(
 # Interactive mode
 # ---------------------------------------------------------------------------
 
-def interactive_prompt(ranked: list[dict]) -> tuple[str, dict | None]:
+def _list_entities(ranked: list[dict]):
+    for i, r in enumerate(ranked):
+        e = r["entity"]
+        email = e["email"] or "—"
+        print(f"  {i+1}. {e['name']}  ({e['client_key'] or '—'})  email={email}  appts={r['appointments']}")
+
+
+def interactive_prompt(ranked: list[dict]) -> tuple[str, dict | list | None]:
     """
-    Returns (action, keep_entity_or_None).
-    action: ACCEPT | OVERRIDE | SKIP | NOT_DUPLICATE
+    Returns (action, payload).
+      ACCEPT        → payload = keep_entity
+      OVERRIDE      → payload = keep_entity
+      PARTIAL       → payload = {"receiver": entity, "removes": [entity, ...]}
+      SKIP          → payload = None
+      NOT_DUPLICATE → payload = None
     """
     print(f"\nOptions:")
-    print(f"  [A] Accept recommendation  (keep #{1}: {ranked[0]['entity']['name']})")
+    print(f"  [A] Accept recommendation  (keep #1: {ranked[0]['entity']['name']})")
     print(f"  [O] Override — choose which entity to keep")
+    print(f"  [P] Partial — remove some, keep others, designate data receiver")
     print(f"  [S] Skip — decide later")
     print(f"  [N] Not duplicates — mark and skip")
 
     while True:
-        choice = input("\nYour choice [A/O/S/N]: ").strip().upper()
+        choice = input("\nYour choice [A/O/P/S/N]: ").strip().upper()
 
         if choice == "A":
             return "ACCEPT", ranked[0]["entity"]
 
         if choice == "O":
             print("\nEnter the number (#) of the entity to KEEP:")
-            for i, r in enumerate(ranked):
-                e = r["entity"]
-                print(f"  {i+1}. {e['name']}  ({e['client_key'] or '—'})  appts={r['appointments']}")
+            _list_entities(ranked)
             while True:
                 num = input("Keep # (or paste entity ID): ").strip()
                 if num.isdigit() and 1 <= int(num) <= len(ranked):
                     return "OVERRIDE", ranked[int(num) - 1]["entity"]
-                # Try matching by ID or client_key
                 match = next((r["entity"] for r in ranked
                               if r["entity"]["id"] == num or r["entity"]["client_key"] == num), None)
                 if match:
                     return "OVERRIDE", match
                 print("  Invalid — try again.")
+
+        if choice == "P":
+            print("\nWhich entities should be REMOVED? (comma-separated numbers)")
+            _list_entities(ranked)
+            while True:
+                raw = input("Remove #s: ").strip()
+                try:
+                    remove_nums = [int(x.strip()) for x in raw.split(",") if x.strip()]
+                except ValueError:
+                    print("  Enter comma-separated numbers.")
+                    continue
+                if not remove_nums:
+                    print("  Enter at least one number.")
+                    continue
+                if any(n < 1 or n > len(ranked) for n in remove_nums):
+                    print(f"  Numbers must be between 1 and {len(ranked)}.")
+                    continue
+                if len(set(remove_nums)) >= len(ranked):
+                    print("  At least one entity must be kept.")
+                    continue
+                break
+
+            remove_indices = {n - 1 for n in set(remove_nums)}
+            removes  = [ranked[i]["entity"] for i in remove_indices]
+            kept     = [ranked[i] for i in range(len(ranked)) if i not in remove_indices]
+
+            if len(kept) == 1:
+                receiver = kept[0]["entity"]
+                print(f"\n  Receiver (only kept entity): {receiver['name']}")
+            else:
+                print("\nWhich entity should RECEIVE migrated data? (others are kept untouched)")
+                for i, r in enumerate(kept):
+                    e = r["entity"]
+                    email = e["email"] or "—"
+                    print(f"  {i+1}. {e['name']}  ({e['client_key'] or '—'})  email={email}  appts={r['appointments']}")
+                while True:
+                    num = input("Receiver #: ").strip()
+                    if num.isdigit() and 1 <= int(num) <= len(kept):
+                        receiver = kept[int(num) - 1]["entity"]
+                        break
+                    print("  Invalid — try again.")
+
+            return "PARTIAL", {"receiver": receiver, "removes": removes}
 
         if choice == "S":
             return "SKIP", None
@@ -492,7 +617,7 @@ def interactive_prompt(ranked: list[dict]) -> tuple[str, dict | None]:
         if choice == "N":
             return "NOT_DUPLICATE", None
 
-        print("  Please enter A, O, S, or N.")
+        print("  Please enter A, O, P, S, or N.")
 
 
 # ---------------------------------------------------------------------------
@@ -529,8 +654,8 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--threshold", type=int, default=85,
                         help="Fuzzy similarity threshold %% (default: 85)")
-    parser.add_argument("--dsn", default="dbname=test_flippro_hostke",
-                        help="PostgreSQL DSN")
+    parser.add_argument("--dsn", default=os.getenv("DSN"),
+                        help="PostgreSQL DSN (or set DSN in .env)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Preview changes without modifying the database")
     parser.add_argument("--group", type=int, default=None,
@@ -538,6 +663,9 @@ def main():
     parser.add_argument("--batch", default=None, metavar="CSV",
                         help="Path to batch decisions CSV")
     args = parser.parse_args()
+
+    if not args.dsn:
+        parser.error("No DSN provided. Set DSN in .env or pass --dsn.")
 
     mode = "batch" if args.batch else "interactive"
     logger.info(f"Starting duplicate resolution | mode={mode} | dry_run={args.dry_run} "
@@ -593,6 +721,7 @@ def main():
             action         = decision["action"]
             keep_entity_id = decision["keep_entity_id"]
 
+            removes_list = None  # batch mode always removes all non-keep entities
             if action == "ACCEPT":
                 keep_entity = ranked[0]["entity"]
             elif action == "OVERRIDE":
@@ -614,7 +743,7 @@ def main():
                 continue
 
         else:  # interactive
-            action, keep_entity = interactive_prompt(ranked)
+            action, payload = interactive_prompt(ranked)
 
             if action == "SKIP":
                 print(f"  → Skipped group {g_idx}.")
@@ -625,11 +754,27 @@ def main():
                 results["not_duplicate"] += 1
                 continue
 
+            if action == "PARTIAL":
+                keep_entity  = payload["receiver"]
+                removes_list = payload["removes"]
+            else:  # ACCEPT or OVERRIDE
+                keep_entity  = payload
+                removes_list = None  # resolve_group will compute all non-keep entities
+
         # Confirm before executing
-        removes = [r["entity"] for r in ranked if r["entity"]["id"] != keep_entity["id"]]
-        print(f"\n  KEEP   → {keep_entity['name']} ({keep_entity['client_key']})")
-        for rem in removes:
-            print(f"  REMOVE → {rem['name']} ({rem['client_key']})")
+        if removes_list is None:
+            removes_list = [r["entity"] for r in ranked if r["entity"]["id"] != keep_entity["id"]]
+
+        remove_ids = {e["id"] for e in removes_list}
+        print()
+        for r in ranked:
+            e = r["entity"]
+            if e["id"] == keep_entity["id"]:
+                print(f"  RECEIVE → {e['name']} ({e['client_key'] or '—'})  ← migrated data lands here")
+            elif e["id"] in remove_ids:
+                print(f"  REMOVE  → {e['name']} ({e['client_key'] or '—'})")
+            else:
+                print(f"  KEEP    → {e['name']} ({e['client_key'] or '—'})  ← untouched")
 
         if args.dry_run:
             print("  [DRY-RUN] Proceeding in dry-run mode.")
@@ -640,7 +785,7 @@ def main():
                 results["skipped"] += 1
                 continue
 
-        ok = resolve_group(conn, cur, grp, ranked, keep_entity, args.dry_run)
+        ok = resolve_group(conn, cur, ranked, keep_entity, args.dry_run, removes=removes_list)
         results["resolved" if ok else "errors"] += 1
 
     # Final summary

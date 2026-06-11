@@ -2,3 +2,7 @@
 __pycache__/
 *.pyc
 duplicate_report_*.xlsx
+*.log
+.claude/
+.env
+*.~lock*

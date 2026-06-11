@@ -15,6 +15,8 @@ Usage:
 
 import argparse
 import logging
+import os
+import re
 import sys
 from collections import defaultdict
 from datetime import datetime
@@ -22,16 +24,17 @@ from itertools import combinations
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import re
-
 import psycopg2
 import yaml
+from dotenv import load_dotenv
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 from rapidfuzz import fuzz
 from tabulate import tabulate
 from tqdm import tqdm
+
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -102,6 +105,30 @@ def is_similar_name(name1: str, name2: str, threshold: int) -> bool:
     return similarity(name1, name2) >= threshold
 
 
+# Emails assigned to on-the-fly entity creation — not a real business email,
+# so a shared address here does NOT indicate a duplicate.
+_GARBAGE_EMAILS = frozenset({
+    "development@innovexsolutions.co.ke",
+})
+
+
+def _real_email(e: dict) -> str:
+    addr = (e.get("email") or "").strip().lower()
+    return addr if addr and addr not in _GARBAGE_EMAILS else ""
+
+
+def email_match(a: dict, b: dict) -> bool:
+    ea, eb = _real_email(a), _real_email(b)
+    return bool(ea and ea == eb)
+
+
+def entity_similarity(a: dict, b: dict) -> float:
+    """Name similarity, boosted to 100 when both entities share a real email."""
+    if email_match(a, b):
+        return 100.0
+    return similarity(a["name"], b["name"])
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -132,11 +159,15 @@ def load_config(config_path: Optional[str] = None) -> dict:
 # DB helpers
 # ---------------------------------------------------------------------------
 
+def _safe_dsn(dsn: str) -> str:
+    return re.sub(r"(password\s*=\s*)\S+", r"\1***", dsn, flags=re.IGNORECASE)
+
+
 def connect(dsn: str):
     """Connect to PostgreSQL database."""
     try:
         conn = psycopg2.connect(dsn)
-        logger.info(f"Connected to database: {dsn}")
+        logger.info(f"Connected to database: {_safe_dsn(dsn)}")
         return conn
     except psycopg2.OperationalError as e:
         logger.error(f"Cannot connect to database: {e}")
@@ -276,10 +307,12 @@ def find_duplicate_groups_optimized(
     block_size: int = 3,   # kept in signature for config compat, no longer used
 ) -> list[list[dict]]:
     """
-    Compare every entity pair (full O(n²) scan) with a progress bar.
-    Blocking is intentionally skipped: at ~950 entities the full scan
-    finishes in seconds and blocking risks missing cross-prefix duplicates
-    (e.g. 'ABC MOTORS' vs 'ABC MOTORS LTD' could land in different prefix blocks).
+    Complete-linkage clustering over a full O(n²) pair scan.
+
+    An entity joins a group only if it meets the threshold with every existing
+    member — not just one chain link. This prevents 'A≈B and B≈C at 60%'
+    from pulling unrelated A and C into the same group.
+    Pairs are processed strongest-first so high-confidence pairs form group cores.
     """
     n = len(entities)
     logger.info(f"Finding duplicates among {n} entities (threshold: {threshold}%)")
@@ -287,36 +320,57 @@ def find_duplicate_groups_optimized(
     if n < 2:
         return []
 
-    adjacency = defaultdict(set)
+    # Collect all pairs above threshold with their scores.
+    sim_pairs: dict[tuple, float] = {}
     total = n * (n - 1) // 2
-
     with tqdm(total=total, desc="Comparing entities", unit="pair") as pbar:
         for i, j in combinations(range(n), 2):
-            if similarity(entities[i]["name"], entities[j]["name"]) >= threshold:
-                adjacency[i].add(j)
-                adjacency[j].add(i)
+            s = entity_similarity(entities[i], entities[j])
+            if s >= threshold:
+                sim_pairs[(i, j)] = s  # i < j always
             pbar.update(1)
 
-    # BFS connected components
-    visited = set()
-    groups  = []
-    for start in range(n):
-        if start in visited or start not in adjacency:
-            continue
-        group_indices = set()
-        queue = [start]
-        while queue:
-            node = queue.pop()
-            if node in visited:
-                continue
-            visited.add(node)
-            group_indices.add(node)
-            queue.extend(adjacency[node] - visited)
-        if len(group_indices) > 1:
-            groups.append([entities[i] for i in sorted(group_indices)])
+    # Complete-linkage clustering — process strongest pairs first.
+    group_id: dict[int, int] = {}
+    members:  dict[int, set] = {}
+    next_gid  = 0
 
-    logger.info(f"Found {len(groups)} duplicate groups")
-    return groups
+    def all_connected(idx: int, grp: set) -> bool:
+        return all((min(idx, m), max(idx, m)) in sim_pairs for m in grp)
+
+    for (i, j) in sorted(sim_pairs, key=lambda p: -sim_pairs[p]):
+        gi, gj = group_id.get(i), group_id.get(j)
+
+        if gi is None and gj is None:
+            members[next_gid] = {i, j}
+            group_id[i] = group_id[j] = next_gid
+            next_gid += 1
+
+        elif gi is None:
+            if all_connected(i, members[gj]):
+                members[gj].add(i)
+                group_id[i] = gj
+
+        elif gj is None:
+            if all_connected(j, members[gi]):
+                members[gi].add(j)
+                group_id[j] = gi
+
+        elif gi != gj:
+            if all((min(a, b), max(a, b)) in sim_pairs
+                   for a in members[gi] for b in members[gj]):
+                keep, drop = (gi, gj) if len(members[gi]) >= len(members[gj]) else (gj, gi)
+                for m in members[drop]:
+                    group_id[m] = keep
+                members[keep].update(members.pop(drop))
+
+    result = [
+        [entities[i] for i in sorted(grp)]
+        for grp in members.values()
+        if len(grp) >= 2
+    ]
+    logger.info(f"Found {len(result)} duplicate groups")
+    return result
 
 
 # Legacy function for backward compatibility
@@ -490,7 +544,7 @@ def build_workbook(groups, appt_map, ins_map, branch_map, threshold) -> Workbook
     wb = Workbook()
     wb.remove(wb.active)   # remove default sheet
 
-    _sheet_workplan(wb, groups, appt_map, ins_map, branch_map, threshold)
+    _sheet_workplan(wb, groups, appt_map, ins_map, branch_map)
     _sheet_appointments(wb, groups, appt_map)
     _sheet_mappings(wb, groups, ins_map)
     _sheet_branches(wb, groups, branch_map)
@@ -499,7 +553,7 @@ def build_workbook(groups, appt_map, ins_map, branch_map, threshold) -> Workbook
     return wb
 
 
-def _sheet_workplan(wb, groups, appt_map, ins_map, branch_map, threshold):  # noqa: PLR0913
+def _sheet_workplan(wb, groups, appt_map, ins_map, branch_map):  # noqa: PLR0913
     """Create main workplan/summary sheet."""
     ws = wb.create_sheet("Workplan (Summary)")
     ws.freeze_panes = "A2"
@@ -508,7 +562,7 @@ def _sheet_workplan(wb, groups, appt_map, ins_map, branch_map, threshold):  # no
         "Group #", "Group Name", "Entity ID", "Entity Name", "Type",
         "Status", "Client Key", "Onboarded", "Email", "Phone",
         "Appointments", "Insurance Mappings", "Branches",
-        "Similarity %", "Recommended Action",
+        "Name Similarity %", "Email Match", "Recommended Action",
         # Tracker columns for the team
         "Decision", "Assignee", "Resolved", "Notes",
     ]
@@ -519,11 +573,12 @@ def _sheet_workplan(wb, groups, appt_map, ins_map, branch_map, threshold):  # no
     for g_idx, group in enumerate(groups, 1):
         ranked = rank_group(group, appt_map, ins_map, branch_map)
 
-        # Best similarity score within this group
-        best_score = max(
-            round(similarity(a["name"], b["name"]))
-            for a, b in combinations(group, 2)
+        # Best name similarity and whether any pair shares a real email.
+        pairs = list(combinations(group, 2))
+        best_name_score = max(
+            round(similarity(a["name"], b["name"])) for a, b in pairs
         ) if len(group) > 1 else 100
+        group_email_match = any(email_match(a, b) for a, b in pairs)
 
         for i, r in enumerate(ranked):
             e      = r["entity"]
@@ -536,12 +591,12 @@ def _sheet_workplan(wb, groups, appt_map, ins_map, branch_map, threshold):  # no
                 "Yes" if e["is_onboarded"] else "No",
                 e["email"] or "", e["phone_number"] or "",
                 r["appointments"], r["insurance_mappings"], r["branches"],
-                f"{best_score}%", action,
+                f"{best_name_score}%", "Yes" if group_email_match else "", action,
                 "", "", "", "",   # tracker blanks
             ]
             for col, val in enumerate(vals, 1):
                 _data_cell(ws, row, col, val, fill=fill,
-                           bold=(col == 15), center=(col in {1, 11, 12, 13, 14, 15}))
+                           bold=(col == 16), center=(col in {1, 11, 12, 13, 14, 15, 16}))
             row += 1
 
     _auto_width(ws)
@@ -668,21 +723,23 @@ def _sheet_similarity(wb, groups, threshold):
     ws = wb.create_sheet("Similarity Scores")
     ws.freeze_panes = "A2"
 
-    headers = ["Group #", "Group Name", "Entity A", "Entity B", "Score %", "Meets Threshold"]
+    headers = ["Group #", "Group Name", "Entity A", "Entity B",
+               "Name Score %", "Email Match", "Meets Threshold"]
     _hdr_row(ws, 1, headers)
     ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}1"
 
     row = 2
     for g_idx, group in enumerate(groups, 1):
         for a, b in combinations(group, 2):
-            score = round(similarity(a["name"], b["name"]))
-            meets = score >= threshold
-            fill  = _KEEP_FILL if meets else None
+            name_score = round(similarity(a["name"], b["name"]))
+            em         = email_match(a, b)
+            meets      = entity_similarity(a, b) >= threshold
+            fill       = _KEEP_FILL if meets else None
             for col, val in enumerate([
                 g_idx, group[0]["name"], a["name"], b["name"],
-                f"{score}%", "Yes" if meets else "No",
+                f"{name_score}%", "Yes" if em else "", "Yes" if meets else "No",
             ], 1):
-                _data_cell(ws, row, col, val, fill=fill, center=(col in {1, 5, 6}))
+                _data_cell(ws, row, col, val, fill=fill, center=(col in {1, 5, 6, 7}))
             row += 1
 
     _auto_width(ws)
@@ -697,7 +754,7 @@ def main():
     parser.add_argument("--threshold", type=int, default=None,
                         help="Fuzzy similarity threshold %% (default: 85)")
     parser.add_argument("--dsn", default=None,
-                        help="PostgreSQL DSN (default: dbname=test_flippro_hostke)")
+                        help="PostgreSQL DSN (or set DSN in .env)")
     parser.add_argument("--xlsx", default=None,
                         help="Excel output path (default: duplicate_report_<timestamp>.xlsx)")
     parser.add_argument("--no-terminal", action="store_true",
@@ -719,7 +776,9 @@ def main():
     
     # Use command line args or config values
     threshold = args.threshold or config.get('threshold', 85)
-    dsn = args.dsn or config.get('dsn', 'dbname=test_flippro_hostke')
+    dsn = args.dsn or config.get('dsn') or os.getenv("DSN")
+    if not dsn:
+        parser.error("No DSN provided. Set DSN in .env or pass --dsn.")
     
     # Generate output path
     if args.xlsx:
@@ -731,7 +790,7 @@ def main():
         xlsx_path = str(Path(output_dir) / f"{prefix}_{timestamp}.xlsx")
 
     logger.info(f"Starting duplicate entity analysis")
-    logger.info(f"Connected  : {dsn}")
+    logger.info(f"Connected  : {_safe_dsn(dsn)}")
     logger.info(f"Threshold  : {threshold}%")
     if not args.dry_run:
         logger.info(f"Excel out  : {xlsx_path}")
